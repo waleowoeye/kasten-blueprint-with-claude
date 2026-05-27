@@ -310,3 +310,22 @@ kubectl delete ns elasticsearch-eck-minio --ignore-not-found
 kubectl delete restorepointcontent \
   -l k10.kasten.io/appNamespace=elasticsearch-eck-minio --ignore-not-found
 ```
+
+## Status
+
+All three lifecycle phases pass end-to-end:
+
+- **Backup** — `backupPrehook` creates a timestamped ES snapshot
+  (`kasten-YYYYMMDDHHMMSS`), syncs the keeper filesystem, emits the
+  snapshot name as a Kanister artifact. Kasten then snapshots the MinIO
+  PVC. The ES data PVCs and StatefulSet are never touched.
+- **Restore** — Kasten restores **only** the MinIO PVC; the live ES
+  cluster keeps running. `restorePosthook` discovers the snapshot's user
+  indices, deletes any pre-existing copies in the live cluster, and
+  restores by exact name list via the ES REST API. Verified: a 5-doc
+  `test-index` is recovered identically with `include_global_state:false`,
+  and ES pods retain their uptime through the entire restore.
+- **Delete** — When the RestorePointContent is removed, Kasten invokes
+  the blueprint's `delete` action, which calls
+  `DELETE /_snapshot/kasten-repo/<snapshot>` against the live ES.
+  Verified end-to-end against a real Kasten policy.
