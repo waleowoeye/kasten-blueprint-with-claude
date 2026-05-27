@@ -56,7 +56,7 @@ Create a blueprint to backup a CNPG instance
 I want a blueprint to backup a CNPG instance using barman in order to leverage PIT (Point In Time) restore. I don't want you to implement the restore pre and post hook 
 because this is not adapted in the Kasten context. Instead I want you to document the steps by giving an example to restore at a precise PIT. 
 The barman configuration will work with a local minio cluster, one minio cluster per cnpg instance. 
-We are definitely in the pattern 4C. "Database backup via a local MinIO keeper (S3-protocol data movers)" so you don't need to ask for the validation of the pattern.
+We are definitely in the pattern 5. "Database dump or snapshot via a local MinIO keeper (PVC mounted by a keeper, but the keeper exposes S3-protocol)" so you don't need to ask for the validation of the pattern.
 
 # Mongodb percona 
 
@@ -65,3 +65,8 @@ Create a blueprint for mongodb deployed with the Percona operator
 # Mongodb percona sharded
 
 Create a blueprint for mongodb deployed with the Percona operator but in sharded mode and using the backup/restore CR.
+
+# Galera
+
+Can you create a blueprint for a Galera cluster deployed on Openshift (used )
+

@@ -39,9 +39,10 @@ Select the backup pattern from the list in [kasten-kanister.md](kasten-kanister.
 
 1. **Fence and quiesce a replica** — best choice when a replica exists; zero primary impact.
 2. **Quiesce** — preferred when crash-consistent snapshots are sufficient and incrementality matters (backup time stays constant as data grows).
-3. **Database snapshot on a permanent PVC (sub-case A — PVC mounted by workload)** — the workload mounts a dedicated backup PVC; `backupPrehook` uses `KubeExec` to run the snapshot tool in the workload pod. PVC pre-exists at discovery time. BlueprintBinding on the workload CR.
-4. **Database dump or snapshot on a permanent PVC (sub-case B — keeper Deployment)** — a dedicated Deployment that runs the backup tool image mounts the backup PVC permanently; `backupPrehook` uses `KubeExec` into the keeper pod. PVC pre-exists at discovery time. BlueprintBinding on the keeper Deployment.
-5. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. Dangerous; an extra PVC should always be preferred when possible.
+3. **Database snapshot on a permanent workload PVC (PVC mounted by workload)** — the workload mounts a dedicated backup PVC; `backupPrehook` uses `KubeExec` to run the snapshot tool in the workload pod. PVC pre-exists at discovery time. BlueprintBinding on the workload CR.
+4. **Database dump or snapshot on a permanent Keeper PVC (PVC mounted by keeper)** — a dedicated Deployment that runs the backup tool image mounts the backup PVC permanently; `backupPrehook` uses `KubeExec` into the keeper pod. PVC pre-exists at discovery time. BlueprintBinding on the keeper Deployment.
+5. **Database dump or snapshot via a local MinIO keeper (PVC mounted by a keeper, but the keeper exposes S3-protocol)** — a MinIO Deployment in the application namespace acts as the local S3 endpoint, backed by a permanent PVC; the workload's native S3 backup tool writes to MinIO and Kasten snapshots the MinIO PVC. BlueprintBinding on the MinIO Deployment.
+6. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. Dangerous; an extra PVC should always be preferred when possible.
 
 > **Why permanent PVC patterns are ranked first:** Kasten's PVC discovery runs **before**
 > `backupPrehook` executes. Permanent PVCs pre-exist at discovery time and are correctly
@@ -60,18 +61,18 @@ Select the backup pattern from the list in [kasten-kanister.md](kasten-kanister.
 > - Adding a second workload type requiring a temporary PVC requires modifying the same blueprint —
 >   an **OCP violation**.
 > - **Only deploy one type of workload per namespace** when using these patterns.
-> Only choose patterns 6–8 when patterns 1–5 are technically infeasible.
+> Only choose patterns 7–9 when patterns 1–6 are technically infeasible.
 
-6. **Database snapshot on a temporary PVC** — database snapshot tool writes to a temporary PVC created in a BackupAction preHook before discovery. Incrementality via append-only snapshot files.
-7. **Logical dump on a temporary PVC** — dump tool writes to a temporary PVC created in a BackupAction preHook. No incrementality.
-8. **Create dump of an external database on a temporary PVC** — for databases outside the cluster whose dump can be created inside the cluster. No incrementality.
+7. **Database snapshot on a temporary PVC** — database snapshot tool writes to a temporary PVC created in a BackupAction preHook before discovery. Incrementality via append-only snapshot files.
+8. **Logical dump on a temporary PVC** — dump tool writes to a temporary PVC created in a BackupAction preHook. No incrementality.
+9. **Create dump of an external database on a temporary PVC** — for databases outside the cluster whose dump can be created inside the cluster. No incrementality.
 
 When **Kasten is not the data mover**, two additional patterns apply. These are not ranked against the list above — they are the only valid options when the database is managed or when the operator owns the backup mechanism:
 
-9. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, etc.); the cloud provider owns immutability.
-10. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, etc.); the operator owns immutability.
+10. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, etc.); the cloud provider owns immutability.
+11. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, etc.); the operator owns immutability.
 
-The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–4 with append-only snapshots are incremental; plain dump patterns are not).
+The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–5 with append-only snapshots are incremental; plain dump patterns are not).
 
 > ⛔ **MANDATORY STOP — do not proceed to Step 2 until the user has explicitly approved the pattern.**
 >

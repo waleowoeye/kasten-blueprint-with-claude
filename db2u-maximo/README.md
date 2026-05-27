@@ -31,7 +31,7 @@ DB2 is deployed by the DB2u operator as a `Db2uCluster` CR. Each cluster creates
 
 Those storage class can change depending of your installation.
 
-The blueprint uses [**Pattern 3A — database snapshot on a permanent backup PVC**](https://github.com/michaelcourcy/kasten-claude/blob/main/kasten-kanister.md#3-database-snapshot-on-a-permanent-pvc-sub-case-a--pvc-mounted-by-workload). The `backupPrehook`
+The blueprint uses [**Pattern 3 — database snapshot on a permanent workload PVC**](https://github.com/michaelcourcy/kasten-claude/blob/main/kasten-kanister.md#3-database-snapshot-on-a-permanent-workload-pvc-pvc-mounted-by-workload). The `backupPrehook`
 runs `db2 backup db BLUDB online … include logs` inside the DB2u engine pod, writing the backup
 image to the backup PVC at `/mnt/backup/backup/`. The Blueprint copy also the master label/encryption key of the database.
  Kasten then snapshots all PVCs (including the backup PVC). 

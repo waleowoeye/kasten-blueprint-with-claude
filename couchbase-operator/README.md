@@ -2,7 +2,7 @@
 
 ## Pattern
 
-**Pattern 4 — Database backup on a permanent PVC (sub-case B: keeper Deployment)**
+**Pattern 4 — Database dump or snapshot on a permanent Keeper PVC (PVC mounted by keeper)**
 
 A dedicated `cb-example-keeper` Deployment mounts the `cb-example-keeper` PVC permanently.
 The `backupPrehook` uses `KubeExec` to run `cbbackupmgr backup` inside the keeper pod,

@@ -1,4 +1,4 @@
-# PSMDB pbm Blueprint (Pattern 4C — MinIO Keeper)
+# PSMDB pbm Blueprint (Pattern 5 — MinIO Keeper)
 
 Kasten blueprint for **sharded** Percona Server for MongoDB (PSMDB) clusters that use
 **Percona Backup for MongoDB (pbm) to a local MinIO instance**. Kasten snapshots the MinIO
@@ -31,7 +31,7 @@ create a `PerconaServerMongoDBRestore` CR and wait.
 
 ## Pattern
 
-**Pattern 4C — pbm backup via a local MinIO keeper (vendor operator data mover).**
+**Pattern 5 — pbm backup via a local MinIO keeper (vendor operator data mover).**
 
 A dedicated MinIO `Deployment` (the *keeper*) with a permanent PVC stores the pbm archive.
 The `backupPrehook` blueprint action:

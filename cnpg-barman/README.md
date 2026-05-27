@@ -1,4 +1,4 @@
-# CNPG Barman Blueprint (Pattern 4C — MinIO Keeper)
+# CNPG Barman Blueprint (Pattern 5 — MinIO Keeper)
 
 Kasten blueprint for CloudNativePG clusters that use **barman-cloud WAL archiving to a local MinIO instance**. Kasten snapshots the MinIO PVC (which contains the full barman archive), enabling Point-In-Time Recovery (PITR) from any Kasten restore point.
 
@@ -16,7 +16,7 @@ Kasten blueprint for CloudNativePG clusters that use **barman-cloud WAL archivin
 
 ## Pattern
 
-**Pattern 4C — Database backup via a local MinIO keeper (vendor operator data mover).**
+**Pattern 5 — Database backup via a local MinIO keeper (vendor operator data mover).**
 
 A dedicated MinIO `Deployment` (the *keeper*) with a permanent PVC stores the CNPG barman archive. The `backupPrehook` blueprint action:
 1. Creates a CNPG `Backup` CR to trigger a barman base backup.

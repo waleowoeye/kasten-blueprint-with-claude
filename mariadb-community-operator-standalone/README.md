@@ -50,7 +50,7 @@ Advantages:
 
 Limitation:
 - Granular restore (single table or database) is not possible — the whole PVC is restored.
-  If granular restore is required, switch to pattern 4 (logical dump on temp PVC).
+  If granular restore is required, switch to pattern 8 (logical dump on temp PVC).
 
 ## Operator ownership chain
 
