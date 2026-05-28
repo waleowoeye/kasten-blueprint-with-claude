@@ -82,55 +82,80 @@ actions:
             - -c
             - 'echo "backupPosthook: nothing to do"'
 
-  # restorePrehook ─ deletes any user indices that conflict with the
-  # snapshot so the upcoming restore can recreate them. Not triggered in
-  # Kasten ≤ 8.5.x — included for forward compatibility. The same logic
-  # runs in restorePosthook so the blueprint works on current Kasten too.
+  # restorePrehook ─ deletes the live Elasticsearch CR so ECK garbage-
+  # collects the StatefulSet, pods, and data PVCs via its finalizer.
+  # Kasten then restores the CR (along with Services, Secrets, MinIO
+  # keeper) cleanly, ECK rebuilds the cluster with fresh empty PVCs, and
+  # restorePosthook re-hydrates the data from the snapshot in MinIO.
+  #
+  # Kasten phase semantics (post-8.5.x): restorePrehook only fires when
+  # the bound resource (the MinIO keeper Deployment) is present in the
+  # target namespace. That makes this phase automatically scoped to
+  # **in-place restore**:
+  #   - In-place restore: keeper is live → this phase runs → CR cleanup.
+  #   - DR/migration restore (namespace deleted): keeper is absent →
+  #     Kasten silently skips this phase → no cleanup needed (nothing to
+  #     conflict with). Kasten just restores everything and ECK builds
+  #     the cluster from scratch.
+  #
+  # KubeTask in kasten-io (not KubeExec into the keeper) because the
+  # keeper's `tools` sidecar ships curl+kando but not kubectl.
+  # michaelcourcy/kasten-tools adds kubectl to the same base image.
+  #
+  # Not triggered in Kasten ≤ 8.5.x — README documents the equivalent
+  # manual step for in-place restores on current Kasten. DR restores
+  # work automatically even on ≤ 8.5.x because there is no live CR to
+  # clean up in the first place.
   restorePrehook:
     inputArtifactNames:
       - kastenSnapshot
     phases:
-      - func: KubeExec
-        name: preRestoreDelete
-        objects:
-          esCreds:
-            kind: Secret
-            name: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}-es-elastic-user'
-            namespace: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+      - func: KubeTask
+        name: deleteLiveCluster
         args:
-          namespace: '{{ .Object.metadata.namespace }}'
-          pod:       '{{ index .Deployment.Pods 0 }}'
-          container: tools
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
           command:
             - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
             - -c
             - |
               WORKLOAD='{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}'
               NS='{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
-              SNAPSHOT='{{ .ArtifactsIn.kastenSnapshot.KeyValue.snapshotName }}'
-              ES_URL="https://${WORKLOAD}-es-http.${NS}.svc:9200"
-              ELASTIC_PASS='{{ index .Phases.preRestoreDelete.Secrets.esCreds.Data "elastic" | toString }}'
 
-              # List user indices captured in the snapshot (non-`.`-prefixed).
-              # ES 8.x rejects wildcards in destructive operations
-              # (`action.destructive_requires_name=true`), so delete by exact
-              # name. Existing data streams and `.ds-*` indices are owned by
-              # ES itself and left untouched.
-              SNAP_JSON=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
-                "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}")
-              USER_INDICES=$(echo "${SNAP_JSON}" \
-                | sed -n 's/.*"indices"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p' \
-                | tr -d '[]"' \
-                | tr ',' '\n' \
-                | grep -v '^\.' \
-                | grep -v '^$')
-              echo "User indices in snapshot: ${USER_INDICES:-<none>}"
-              for IDX in ${USER_INDICES}; do
-                echo "  deleting ${IDX} (idempotent)"
-                curl -sk -u "elastic:${ELASTIC_PASS}" \
-                  -X DELETE "${ES_URL}/${IDX}" || true
-                echo
+              if ! kubectl get elasticsearch "${WORKLOAD}" -n "${NS}" > /dev/null 2>&1; then
+                echo "No live Elasticsearch ${WORKLOAD} in ${NS} — nothing to clean up."
+                exit 0
+              fi
+
+              echo "Deleting live Elasticsearch ${WORKLOAD} so ECK can garbage-collect STS+pods+data PVCs..."
+              kubectl delete elasticsearch "${WORKLOAD}" -n "${NS}" --wait=false
+
+              echo "Waiting for ECK to finalize cleanup (StatefulSet gone)..."
+              for i in $(seq 1 60); do
+                if ! kubectl get sts -n "${NS}" \
+                    -l "elasticsearch.k8s.elastic.co/cluster-name=${WORKLOAD}" 2>/dev/null | grep -q es-default; then
+                  echo "StatefulSet gone after ${i} attempts."
+                  break
+                fi
+                sleep 5
               done
+
+              echo "Waiting for ES data PVCs to be garbage-collected..."
+              for i in $(seq 1 60); do
+                LEFT=$(kubectl get pvc -n "${NS}" \
+                  -l "elasticsearch.k8s.elastic.co/cluster-name=${WORKLOAD}" 2>/dev/null \
+                  -o jsonpath='{.items[*].metadata.name}' || true)
+                if [ -z "${LEFT}" ]; then
+                  echo "Data PVCs gone after ${i} attempts."
+                  break
+                fi
+                sleep 5
+              done
+              echo "Cleanup complete — Kasten will recreate the CR + fresh PVCs in the upcoming phases."
 
   # restorePosthook ─ waits for ES to be reachable on the restored MinIO
   # PVC, closes any open indices (idempotent fallback because restorePrehook
@@ -176,6 +201,21 @@ actions:
                 echo "  [${i}] ES not ready (HTTP ${STATUS})"
                 sleep 5
               done
+
+              # Register the S3 snapshot repository (idempotent PUT).
+              # In in-place restores the repo is already registered and this
+              # is a no-op. In DR restores ECK has just rebuilt the cluster
+              # from scratch, so the cluster state is empty and the repo
+              # must be (re-)registered before we can read the snapshot.
+              # Hardcoding the bucket name + endpoint to match the keeper's
+              # naming convention (`<workload>-minio` Service in the same
+              # namespace, bucket `es-snapshots`).
+              echo "Registering snapshot repository kasten-repo (idempotent)..."
+              curl -sk -u "elastic:${ELASTIC_PASS}" \
+                -X PUT "${ES_URL}/_snapshot/kasten-repo" \
+                -H 'Content-Type: application/json' \
+                -d "{\"type\":\"s3\",\"settings\":{\"bucket\":\"es-snapshots\",\"endpoint\":\"${WORKLOAD}-minio.${NS}.svc:9000\",\"protocol\":\"http\",\"path_style_access\":true}}"
+              echo
 
               # Discover the snapshot's user indices (non-`.`-prefixed).
               # The pattern `*,-.*` in the restore body does NOT exclude

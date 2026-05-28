@@ -200,69 +200,165 @@ intended for a non-Elasticsearch S3-protocol workload (e.g.
 [`cnpg-barman/`](../cnpg-barman/) uses its own label `cnpg-barman-minio`)
 is unaffected.
 
-Then create the Kasten backup policy. The policy must:
+Then create the Kasten backup policy. The policy needs:
 
-1. Use a **Location profile** (not Infra) as `backupParameters.profile` so that
-   Kanister phases have a profile available at restore time.
-2. **Exclude every ECK-managed resource from the backup** — the MinIO
-   keeper PVC is the only thing we want in the restore point. ECK rebuilds
-   the StatefulSet/Services/Secrets/Pods from the live Elasticsearch CR;
-   re-applying them from a restore point causes a destructive rolling
-   reconciliation that disrupts the cluster and breaks master-quorum
-   (see "Why the broad exclusion" below).
-3. **Exclude the Elasticsearch CR itself** — same reason; it stays in
-   the live cluster.
-
-Example policy filter:
+1. A **Location profile** (not Infra) for both `backup` and `export` actions —
+   blueprint phases need it, and DR restores need the data in S3.
+2. An **`export` action** with `exportData: enabled: true` so the restore
+   point survives namespace deletion. Without export, the in-cluster CSI
+   snapshots are deleted along with their VolumeSnapshot CRs when the
+   namespace is gone (`deletionPolicy: Delete` is the default on most CSI
+   classes), and DR restores fail with `InvalidSnapshot.NotFound`.
+3. An `excludeResources` filter that excludes **every ECK-managed resource**
+   (label `common.k8s.elastic.co/type=elasticsearch`) — but **keeps the
+   Elasticsearch CR**. ECK regenerates StatefulSet, Services, Secrets,
+   ConfigMaps, Pods, and data PVCs from the CR on restore. Restoring them
+   from the backup interferes with ECK's reconciliation (see "Why exclude
+   ECK-managed resources" below).
 
 ```yaml
-backupParameters:
-  filters:
-    excludeResources:
-      # Skip every ECK-managed resource (StatefulSet, Services, Secrets,
-      # PVCs, ConfigMaps, Pods) — they all carry this label.
-      - matchLabels:
-          common.k8s.elastic.co/type: elasticsearch
-      # The Elasticsearch CR doesn't carry the label above, so exclude
-      # by group+resource.
-      - group: elasticsearch.k8s.elastic.co
-        resource: elasticsearches
+spec:
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: <location-profile>
+          namespace: kasten-io
+        filters:
+          excludeResources:
+            # Exclude every ECK-managed resource. ECK rebuilds them from
+            # the ES CR on restore. The ES CR itself does NOT carry this
+            # label and stays in the backup.
+            - matchLabels:
+                common.k8s.elastic.co/type: elasticsearch
+    - action: export
+      exportParameters:
+        profile:
+          name: <location-profile>
+          namespace: kasten-io
+        frequency: '@onDemand'
+        exportData:
+          enabled: true
 ```
 
-### Why the broad exclusion
+### Why exclude ECK-managed resources (but keep the ES CR)
 
-If the backup captures the StatefulSet and ECK objects and Kasten re-applies
-them on restore, ECK reconciles the cluster: it scales the StatefulSet down
-to 1 (because of its "one master at a time" safety), waits for pod-0 to
-become Ready, and then refuses to scale up because pod-0 cannot form a
-quorum without pod-1 and pod-2. The live cluster never recovers without
-manual `kubectl scale sts ... --replicas=3` intervention.
+ECK normally creates and reconciles the StatefulSet, ES Services, ES
+Secrets, ES ConfigMaps, ES Pods, and data PVCs — all derived from the
+Elasticsearch CR. If the backup captures those derived resources and the
+restore re-applies them:
 
-Excluding all ECK-managed resources means **the restore touches only the
-MinIO keeper PVC** (and the keeper Deployment, which is idempotent against
-its own spec). The live ES cluster is never disrupted; the blueprint just
-orchestrates the ES snapshot/restore API against it.
+- The restored StatefulSet creates pods bound to **either** the restored
+  ES data PVCs (in-place) **or** fresh empty ones (DR). In the in-place
+  case the pods read "I was node X in cluster [X,Y,Z]" from the persisted
+  state and refuse to elect a master without quorum; ECK then scales the
+  STS down to 1 in a "limit master node creation" safety, and the cluster
+  deadlocks.
+- In the DR case the restored objects pre-empt ECK's reconciliation —
+  Kasten waits for the restored pods to be Ready before restoring the ES
+  CR, but the pods can never be Ready without the CR's bootstrap config.
 
-## Manual workaround for restore (Kasten ≤ 8.5.x)
+Excluding the ECK-managed resources lets the ES CR be the **single source
+of truth** on both paths: ECK sees the (re-)applied CR, builds a fresh
+StatefulSet with the correct bootstrap config, creates fresh empty data
+PVCs, and elects a master cleanly. `restorePosthook` then orchestrates the
+ES snapshot restore via the REST API to re-hydrate the data.
 
-`restorePrehook` is defined in the blueprint for forward compatibility, but
-the Kasten executor does **not** yet trigger it in 8.5.x — Kasten
-engineering confirmed it ships in a near-future release. The blueprint works
-around this by repeating the same close-indices step inside
-`restorePosthook`, so **no manual operator action is required for restore**
-on current Kasten.
+## Two restore paths
 
-When `restorePrehook` is eventually enabled, the `restorePosthook` fallback
-close becomes a no-op (already-closed indices stay closed; the
-`expand_wildcards=open` query parameter limits the call to open indices).
+The blueprint covers two scenarios with one policy:
 
-## End-to-end test (Step 5)
+### In-place restore (live cluster still up)
 
-Run a full backup/restore cycle through Kasten:
+Use case: rollback after data loss inside an otherwise-healthy cluster
+(dropped index, bad migration, etc.).
+
+**On Kasten ≥ (post-8.5.x where `restorePrehook` fires):** trigger a
+`RestoreAction`. The blueprint's `restorePrehook` deletes the live ES CR;
+ECK garbage-collects the StatefulSet, pods, and data PVCs via its
+finalizer. Kasten then restores the CR + MinIO PVC; ECK rebuilds the
+cluster from scratch with fresh empty PVCs; `restorePosthook` re-hydrates
+the data from the restored MinIO snapshot.
+
+**On Kasten ≤ 8.5.x (current),** `restorePrehook` does not fire. The
+operator must run the equivalent step manually:
+
+```bash
+kubectl delete elasticsearch es-cluster -n elasticsearch-eck-minio
+# Wait for ECK to fully garbage-collect (STS gone, PVCs gone):
+until [ -z "$(kubectl get sts -n elasticsearch-eck-minio \
+  -l elasticsearch.k8s.elastic.co/cluster-name=es-cluster --no-headers 2>/dev/null)" ]; do sleep 5; done
+# Then trigger the Kasten RestoreAction.
+```
+
+### Disaster-recovery / migration restore (namespace destroyed, fresh cluster)
+
+Use case: full namespace loss, cross-cluster migration, restore into a new
+cluster after a regional outage.
+
+`restorePrehook` does not fire (no live MinIO keeper in the target
+namespace — Kasten silently skips the prehook by design, see
+[kasten-kanister.md](../kasten-kanister.md#reserved-action-names--restore)).
+Just trigger the restore against the **exported** RestorePointContent:
+
+```bash
+# 1. Find the exported RPC (the one with `k10.kasten.io/exportProfile` label set).
+EXPORTED_RPC=$(kubectl get restorepointcontent \
+  -l k10.kasten.io/appNamespace=elasticsearch-eck-minio \
+  -o jsonpath='{.items[?(@.metadata.labels.k10\.kasten\.io/exportProfile)].metadata.name}' \
+  | tr ' ' '\n' | tail -1)
+echo "Exported RPC: ${EXPORTED_RPC}"
+
+# 2. Re-create the namespace (Kasten won't if it's missing).
+kubectl create ns elasticsearch-eck-minio
+
+# 3. Re-create a RestorePoint that references the exported RPC.
+cat <<EOF | kubectl create -f - --validate=false
+apiVersion: apps.kio.kasten.io/v1alpha1
+kind: RestorePoint
+metadata:
+  name: dr-restore-target
+  namespace: elasticsearch-eck-minio
+  labels:
+    k10.kasten.io/appName: elasticsearch-eck-minio
+    k10.kasten.io/appNamespace: elasticsearch-eck-minio
+spec:
+  restorePointContentRef:
+    name: ${EXPORTED_RPC}
+EOF
+
+# 4. Trigger the RestoreAction.
+cat <<EOF | kubectl create -f - --validate=false
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RestoreAction
+metadata:
+  generateName: dr-restore-
+  namespace: elasticsearch-eck-minio
+spec:
+  subject:
+    apiVersion: apps.kio.kasten.io/v1alpha1
+    kind: RestorePoint
+    name: dr-restore-target
+    namespace: elasticsearch-eck-minio
+  targetNamespace: elasticsearch-eck-minio
+  profile:
+    name: <location-profile>
+    namespace: kasten-io
+EOF
+```
+
+Kasten restores the ES CR + MinIO keeper. ECK rebuilds the ES cluster
+from scratch with fresh empty PVCs. `restorePosthook` waits for ES to be
+reachable, **(re-)registers the snapshot repository** (idempotent, needed
+because ES cluster state is brand-new in DR), and restores the user
+indices from the snapshot. Verified end-to-end: a 5-doc `test-index` was
+recovered identically after `kubectl delete ns elasticsearch-eck-minio`.
+
+## End-to-end test (in-place flow)
 
 ```bash
 # 1. Trigger a backup via Kasten policy (UI or RunAction)
-#    Wait for status: Complete
+#    Wait for both backup AND export to reach Complete.
 
 # 2. Drop test-index to simulate data loss
 ELASTIC_PASS=$(kubectl get secret es-cluster-es-elastic-user \
@@ -270,18 +366,19 @@ ELASTIC_PASS=$(kubectl get secret es-cluster-es-elastic-user \
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" -X DELETE "https://localhost:9200/test-index"
 
-# 3. Trigger a Kasten RestoreAction (UI or YAML — see CLAUDE.md for the spec).
-#    The live ES cluster is NOT disrupted; only the MinIO PVC is restored
-#    from the Kasten snapshot.
+# 3. On Kasten ≤ 8.5.x: manually delete the live ES CR (see "Two restore
+#    paths" above). On post-8.5.x: skip — restorePrehook handles it.
 
-# 4. After restore completes, verify documents are back.
+# 4. Trigger a Kasten RestoreAction.
+
+# 5. After restore completes, verify documents are back.
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" -X POST "https://localhost:9200/test-index/_refresh"
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" "https://localhost:9200/test-index/_count"
 # Expected: {"count":5,...}
 
-# 5. Retire the restore point to trigger the blueprint's `delete` action.
+# 6. Retire the restore point to trigger the blueprint's `delete` action.
 #    NOTE: `kubectl delete restorepoint <name>` alone does NOT fire the
 #    delete action — Kasten only invokes it when the underlying
 #    RestorePointContent (RPC) is removed. Either delete the RPC directly
@@ -313,18 +410,22 @@ kubectl delete restorepointcontent \
 
 ## Status
 
-All three lifecycle phases pass end-to-end:
+All lifecycle phases pass end-to-end:
 
 - **Backup** — `backupPrehook` creates a timestamped ES snapshot
   (`kasten-YYYYMMDDHHMMSS`), syncs the keeper filesystem, emits the
   snapshot name as a Kanister artifact. Kasten then snapshots the MinIO
-  PVC. The ES data PVCs and StatefulSet are never touched.
-- **Restore** — Kasten restores **only** the MinIO PVC; the live ES
-  cluster keeps running. `restorePosthook` discovers the snapshot's user
-  indices, deletes any pre-existing copies in the live cluster, and
-  restores by exact name list via the ES REST API. Verified: a 5-doc
-  `test-index` is recovered identically with `include_global_state:false`,
-  and ES pods retain their uptime through the entire restore.
+  PVC and exports the data to S3. The ES data PVCs are never touched.
+- **In-place restore** — operator (or `restorePrehook` post-8.5.x)
+  deletes the live ES CR; ECK garbage-collects everything. Kasten
+  restores the CR + MinIO PVC; ECK rebuilds with fresh empty PVCs;
+  `restorePosthook` re-hydrates the user indices via the ES REST API.
+- **DR restore** — `kubectl delete ns elasticsearch-eck-minio` + trigger
+  restore from the **exported** RPC. `restorePrehook` is silently
+  skipped (no live keeper). ECK builds the cluster from scratch from
+  the restored CR; `restorePosthook` (re-)registers the snapshot repo
+  on the brand-new cluster and restores the user indices. Verified:
+  5-doc `test-index` recovered identically after full namespace delete.
 - **Delete** — When the RestorePointContent is removed, Kasten invokes
   the blueprint's `delete` action, which calls
   `DELETE /_snapshot/kasten-repo/<snapshot>` against the live ES.
