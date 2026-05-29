@@ -26,6 +26,10 @@ that was present in the namespace. Create a blueprint that you invoke from a pol
 
 Can you make a blueprint for elasticsearch cluster deployed with the official operator https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s
 
+## Elastic search operator with the minio keeper pattern 
+
+Create a blueprint for elasticsearch but unlike elaticsearch-eck implement pattern 5 (like cnpg-barman) with minio keeper. Also contrary to elasticsearch-eck do not delete all the elasticsearch snapshot at each backup, the elasticsearch snapshot will be deleted by the delete action invoked each time a restorepoint is retired.
+
 ## Couchbase 
 
 Can you make a blueprint for couchbase based on the installation described here 
@@ -68,5 +72,9 @@ Create a blueprint for mongodb deployed with the Percona operator but in sharded
 
 # Galera
 
-Can you create a blueprint for a Galera cluster deployed on Openshift (used )
+Can you create a blueprint using pattern 4 (Database dump or snapshot on a permanent Keeper PVC) for a RHOSO Galera cluster deployed on Openshift. The issue is that we don't have the 
+environment available you must build by speculating on the document [rhoso-galera/RHOSO Galera backup and restore.pdf](./rhoso-galera/RHOSO Galera backup and restore.pdf). You will use the folder rhoso-galera as the directory for the blueprint, blueprintbinding and readme. Also the
+github project for this operator is https://github.com/openstack-k8s-operators/mariadb-operator but there is little documentation, however reading their code can probably help understand 
+the functionning of this operator. As already stated at in the beginning of this prompt we don't want you to test and validate (at least for the moment) because this environment is not 
+available, just create the best possible starting point that will be validated with the customer in future meeting.
 
