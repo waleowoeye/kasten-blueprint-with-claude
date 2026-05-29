@@ -1,0 +1,30 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: rhoso-galera-blueprintbinding
+  namespace: kasten-io
+# Binds the RHOSO Galera blueprint to every keeper Deployment (one per galera
+# cluster), identified by the label rhoso-galera-keeper: "true". This keeps the
+# SRP/OCP intact: adding a new galera cluster is just another labelled keeper,
+# no blueprint change. The DoesNotExist clause leaves room to override a
+# specific keeper with the kanister.kasten.io/blueprint annotation if ever
+# needed.
+spec:
+  blueprintRef:
+    name: rhoso-galera-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: rhoso-galera-keeper
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

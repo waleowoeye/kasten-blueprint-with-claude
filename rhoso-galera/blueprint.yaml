@@ -1,0 +1,297 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: rhoso-galera-blueprint
+  namespace: kasten-io
+# =============================================================================
+# RHOSO Galera — Pattern 4 (database dump on a permanent Keeper PVC)
+#
+# Kasten is the data mover: it snapshots the keeper PVC. The blueprint only
+# produces / reloads a logical mysqldump, mirroring the Red Hat documented
+# runbook (oc exec ... mysqldump / oc exec -i ... mysql < dump).
+#
+# All phases KubeExec into the keeper pod (container "keeper"), which holds
+# oc/kubectl and a ServiceAccount with rights in the application namespace.
+# The dump/reload themselves run INSIDE the galera pod via `kubectl exec`,
+# using that pod's own $DB_ROOT_PASSWORD — no credential ever touches the
+# keeper or the Kanister logs.
+#
+# Conventions (see keeper.yaml):
+#   keeper Deployment / PVC = <galera>-keeper   (e.g. openstack-keeper)
+#   galera StatefulSet      = <galera>-galera   (e.g. openstack-galera)
+#   active Service          = <galera>          (selector pins one pod)
+#   headless Service        = <galera>-galera
+#   data pods               = <galera>-galera-0..N
+#
+# NOT YET VALIDATED on a live RHOSO environment — see README.md.
+# =============================================================================
+actions:
+
+  # ---------------------------------------------------------------------------
+  # backupPrehook — produce a logical dump onto the keeper PVC.
+  # Runs BEFORE Kasten snapshots the keeper PVC. Selects a galera pod that is
+  # NOT currently serving traffic (to limit service impact), dumps every
+  # non-system InnoDB schema with --single-transaction, and fsyncs so the
+  # snapshot captures fully-written data.
+  # ---------------------------------------------------------------------------
+  backupPrehook:
+    phases:
+      - func: KubeExec
+        name: galeraDump
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              set -o pipefail
+
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+              NS="{{ .Deployment.Namespace }}"
+              STS="${GALERA}-galera"
+
+              echo "=== RHOSO Galera backup pre-hook ==="
+              echo "galera cluster : ${GALERA}"
+              echo "namespace      : ${NS}"
+
+              # Pod currently serving traffic (active service selector pin).
+              SVC_ENDPOINT=$(kubectl get svc "${GALERA}" -n "${NS}" \
+                -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}' || true)
+              echo "serving pod    : ${SVC_ENDPOINT:-<none>}"
+
+              # Members currently in the galera cluster, via the serving pod.
+              # (sed strips the DNS suffix, leaving the bare pod name.)
+              SOURCE_FOR_STATUS="${SVC_ENDPOINT:-${GALERA}-galera-0}"
+              ALL_PODS=$(kubectl exec -q -c galera "${SOURCE_FOR_STATUS}" -n "${NS}" -- \
+                bash -c "mysql -nNE -uroot -p\$DB_ROOT_PASSWORD -e \"show status like 'wsrep_incoming_addresses';\"" \
+                | tail -1 | tr ',' '\n' | sed 's/\..*//' | sed 's/[[:space:]]//g')
+
+              # Prefer a pod that is NOT serving traffic; fall back to ordinal 0.
+              BACKUP_POD=$(echo "${ALL_PODS}" | grep -v "^${SVC_ENDPOINT}$" | head -1 || true)
+              BACKUP_POD=${BACKUP_POD:-${GALERA}-galera-0}
+              echo "backup source  : ${BACKUP_POD}"
+
+              # Non-system InnoDB schemas to dump (space-separated list).
+              BACKUP_DBS=$(kubectl exec -q -c galera "${BACKUP_POD}" -n "${NS}" -- \
+                bash -c "mysql -uroot -p\$DB_ROOT_PASSWORD -sN -e \"select distinct table_schema from information_schema.tables where engine='innodb' and table_schema != 'mysql';\"" \
+                | tr '\n' ' ')
+              [ -n "$(echo ${BACKUP_DBS} | tr -d '[:space:]')" ] || { echo "ERROR: no OpenStack schemas found to back up"; exit 1; }
+              echo "schemas        : ${BACKUP_DBS}"
+
+              # Single dump file, OVERWRITTEN every backup. Each Kasten restore
+              # point captures this PVC at its own point in time, so on-PVC
+              # timestamping/history is redundant and would only grow the PVC
+              # without bound. One mysqldump call, one redirect.
+              OUT="/backup/${GALERA}-databases.sql"
+              kubectl exec -q -c galera "${BACKUP_POD}" -n "${NS}" -- \
+                bash -c "mysqldump -uroot -p\$DB_ROOT_PASSWORD --single-transaction --databases ${BACKUP_DBS}" > "${OUT}"
+
+              echo "dump written   : ${OUT} ($(wc -c < "${OUT}") bytes)"
+
+              # Flush page cache so the (block-level) PVC snapshot captures the
+              # fully-written dump rather than 0-byte / partial files.
+              sync
+              echo "=== backup pre-hook complete ==="
+
+  # ---------------------------------------------------------------------------
+  # backupPosthook — verify the dump exists and is non-empty.
+  # Runs AFTER the keeper PVC snapshot is ready. Read-only sanity check.
+  # ---------------------------------------------------------------------------
+  backupPosthook:
+    phases:
+      - func: KubeExec
+        name: verifyDump
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+
+              echo "=== RHOSO Galera backup post-hook: verifying dump ==="
+              OUT="/backup/${GALERA}-databases.sql"
+              [ -s "${OUT}" ] || { echo "ERROR: dump ${OUT} missing or empty"; exit 1; }
+              echo "dump        : ${OUT} ($(wc -c < "${OUT}") bytes)"
+              echo "contains    : $(grep -c '^CREATE DATABASE' "${OUT}" || true) CREATE DATABASE statements"
+              echo "=== backup post-hook complete ==="
+
+  # ---------------------------------------------------------------------------
+  # restorePrehook — forward-compatible cluster prep.
+  #
+  # ⚠️ NOT TRIGGERED in Kasten <= 8.5.x (known limitation). Implemented for
+  # when the fix ships. Until then the equivalent prep is performed
+  # idempotently at the start of restorePosthook, so restore still works today.
+  # See README.md "Restore" for the manual fallback.
+  #
+  # Prep = scale the galera cluster to 1 pod (via OpenStackControlPlane) and
+  # disable DB traffic (clear the active service pod-name selector), per the
+  # Red Hat restore runbook.
+  # ---------------------------------------------------------------------------
+  restorePrehook:
+    phases:
+      - func: KubeExec
+        name: quiesceForRestore
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+              NS="{{ .Deployment.Namespace }}"
+              STS="${GALERA}-galera"
+              # Use the CONTROLPLANE env from the keeper if set; otherwise
+              # discover the (normally single) OpenStackControlPlane in the
+              # namespace. Fail loudly rather than patch an empty name.
+              if [ -z "${CONTROLPLANE}" ]; then
+                CONTROLPLANE=$(kubectl get oscp -n "${NS}" -o jsonpath='{.items[0].metadata.name}')
+              fi
+              [ -n "${CONTROLPLANE}" ] || { echo "ERROR: no OpenStackControlPlane found in ${NS}; set the CONTROLPLANE env on the keeper Deployment"; exit 1; }
+
+              echo "=== RHOSO Galera restore pre-hook: scale to 1 + disable traffic ==="
+              echo "control plane : ${CONTROLPLANE}"
+
+              kubectl patch oscp "${CONTROLPLANE}" -n "${NS}" --type merge \
+                -p '{"spec":{"galera":{"templates":{"'"${GALERA}"'":{"replicas":1}}}}}'
+              echo "waiting for ${STS} to reach 1 available replica ..."
+              kubectl wait sts "${STS}" -n "${NS}" \
+                --for=jsonpath='{.status.availableReplicas}'=1 --timeout=600s
+
+              kubectl patch svc "${GALERA}" -n "${NS}" --type=merge \
+                -p '{"spec":{"selector":{"statefulset.kubernetes.io/pod-name":""}}}'
+              echo "=== restore pre-hook complete ==="
+
+  # ---------------------------------------------------------------------------
+  # restorePosthook — reload the dump and restore service.
+  #
+  # Runs AFTER Kasten has restored the keeper PVC (which now carries the dump).
+  # Self-contained and idempotent so it works whether or not restorePrehook
+  # fired: it (re-)ensures the cluster is at 1 pod with traffic disabled,
+  # optionally drops existing OpenStack schemas, reloads the dump into
+  # <galera>-galera-0, then re-enables traffic and scales back to 3.
+  #
+  # NOTE: per the Red Hat runbook a full MariaDBAccount password rotation for
+  # every OpenStack service is required AFTER this reload to restore service
+  # credentials. That step triggers rolling restarts of OpenStack services and
+  # is intentionally left as a documented manual operator runbook (README.md).
+  # ---------------------------------------------------------------------------
+  restorePosthook:
+    phases:
+      # 1) Ensure scaled to 1 + traffic disabled (idempotent prep).
+      - func: KubeExec
+        name: ensureQuiesced
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+              NS="{{ .Deployment.Namespace }}"
+              STS="${GALERA}-galera"
+              # Use the CONTROLPLANE env from the keeper if set; otherwise
+              # discover the (normally single) OpenStackControlPlane in the
+              # namespace. Fail loudly rather than patch an empty name.
+              if [ -z "${CONTROLPLANE}" ]; then
+                CONTROLPLANE=$(kubectl get oscp -n "${NS}" -o jsonpath='{.items[0].metadata.name}')
+              fi
+              [ -n "${CONTROLPLANE}" ] || { echo "ERROR: no OpenStackControlPlane found in ${NS}; set the CONTROLPLANE env on the keeper Deployment"; exit 1; }
+
+              echo "=== RHOSO Galera restore post-hook [1/3]: ensure quiesced ==="
+              echo "control plane : ${CONTROLPLANE}"
+              kubectl patch oscp "${CONTROLPLANE}" -n "${NS}" --type merge \
+                -p '{"spec":{"galera":{"templates":{"'"${GALERA}"'":{"replicas":1}}}}}'
+              kubectl wait sts "${STS}" -n "${NS}" \
+                --for=jsonpath='{.status.availableReplicas}'=1 --timeout=600s
+              kubectl patch svc "${GALERA}" -n "${NS}" --type=merge \
+                -p '{"spec":{"selector":{"statefulset.kubernetes.io/pod-name":""}}}'
+
+      # 2) Drop existing OpenStack schemas, then reload the dump into galera-0.
+      - func: KubeExec
+        name: reloadDump
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              set -o pipefail
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+              NS="{{ .Deployment.Namespace }}"
+              POD="${GALERA}-galera-0"
+
+              echo "=== RHOSO Galera restore post-hook [2/3]: reload dump ==="
+              OUT="/backup/${GALERA}-databases.sql"
+              [ -s "${OUT}" ] || { echo "ERROR: dump ${OUT} missing or empty"; exit 1; }
+              echo "restoring from : ${OUT} ($(wc -c < "${OUT}") bytes)"
+
+              # Drop existing non-system InnoDB schemas so the reload is clean
+              # (matches the optional drop step in the Red Hat runbook).
+              echo "dropping existing OpenStack schemas ..."
+              kubectl exec -q -c galera "${POD}" -n "${NS}" -- bash -c \
+                "mysql -uroot -p\$DB_ROOT_PASSWORD -sN -e \"select distinct table_schema from information_schema.tables where engine='innodb' and table_schema != 'mysql';\" | xargs -r -n1 mysqladmin -uroot -p\$DB_ROOT_PASSWORD -f drop"
+
+              echo "reloading dump ..."
+              kubectl exec -q -i -c galera "${POD}" -n "${NS}" -- \
+                bash -c "mysql -uroot -p\$DB_ROOT_PASSWORD" < "${OUT}"
+
+              echo "databases now present:"
+              kubectl exec -q -c galera "${POD}" -n "${NS}" -- \
+                bash -c "mysql -uroot -p\$DB_ROOT_PASSWORD -e \"show databases;\""
+
+      # 3) Re-enable traffic and scale back to 3 pods.
+      - func: KubeExec
+        name: resumeCluster
+        args:
+          namespace: "{{ .Deployment.Namespace }}"
+          pod: "{{ index .Deployment.Pods 0 }}"
+          container: keeper
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o errexit
+              KEEPER="{{ .Deployment.Name }}"
+              GALERA="${KEEPER%-keeper}"
+              NS="{{ .Deployment.Namespace }}"
+              STS="${GALERA}-galera"
+              # Use the CONTROLPLANE env from the keeper if set; otherwise
+              # discover the (normally single) OpenStackControlPlane in the
+              # namespace. Fail loudly rather than patch an empty name.
+              if [ -z "${CONTROLPLANE}" ]; then
+                CONTROLPLANE=$(kubectl get oscp -n "${NS}" -o jsonpath='{.items[0].metadata.name}')
+              fi
+              [ -n "${CONTROLPLANE}" ] || { echo "ERROR: no OpenStackControlPlane found in ${NS}; set the CONTROLPLANE env on the keeper Deployment"; exit 1; }
+
+              echo "=== RHOSO Galera restore post-hook [3/3]: resume cluster ==="
+              kubectl patch svc "${GALERA}" -n "${NS}" --type=merge \
+                -p '{"spec":{"selector":{"statefulset.kubernetes.io/pod-name":"'"${GALERA}"'-galera-0"}}}'
+              kubectl patch oscp "${CONTROLPLANE}" -n "${NS}" --type merge \
+                -p '{"spec":{"galera":{"templates":{"'"${GALERA}"'":{"replicas":3}}}}}'
+              echo "waiting for ${STS} to reach 3 available replicas ..."
+              kubectl wait sts "${STS}" -n "${NS}" \
+                --for=jsonpath='{.status.availableReplicas}'=3 --timeout=900s
+              echo "=== restore post-hook complete ==="
+              echo "REMINDER: rotate MariaDBAccount credentials for every OpenStack"
+              echo "service now — see README.md 'Restore OpenStack credentials'."

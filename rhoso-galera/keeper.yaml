@@ -1,0 +1,155 @@
+# =============================================================================
+# RHOSO Galera keeper — Pattern 4 (database dump on a permanent Keeper PVC)
+# =============================================================================
+# Deploy ONE keeper per galera cluster. Naming convention:
+#   keeper Deployment + PVC = <galera-name>-keeper
+# e.g. galera "openstack"        -> keeper "openstack-keeper"
+#      galera "openstack-cell1"  -> keeper "openstack-cell1-keeper"
+#
+# The keeper is an idle pod (oc/kubectl + bash) that the blueprint hooks
+# KubeExec into. It mounts a permanent PVC at /backup; the mysqldump produced
+# by `kubectl exec` into the galera pod is redirected onto this PVC, which
+# Kasten then snapshots. The keeper never holds DB credentials — the dump runs
+# inside the galera pod using that pod's own $DB_ROOT_PASSWORD.
+#
+# NOT YET VALIDATED on a live RHOSO environment — see README.md.
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# ServiceAccount + RBAC for the keeper.
+# The keeper runs ALL kubectl operations (dump, reload, scale, traffic toggle)
+# with this ServiceAccount, so it needs read+exec on galera pods plus the
+# rights to drive the documented restore (patch the active service selector,
+# scale the cluster via the OpenStackControlPlane, wait on the StatefulSet).
+# Scope is the application namespace only (namespaced Role, not ClusterRole).
+# These RBAC objects are a one-time prerequisite and are NOT part of the
+# Kasten backup — they must exist independently of any restore.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhoso-galera-keeper
+  namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhoso-galera-keeper
+  namespace: openstack
+rules:
+  # Locate the active/serving galera pod and the cluster members, and exec the
+  # mysqldump / mysql reload inside the galera container.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Read + flip the active-pod selector to disable/enable DB traffic on restore.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "patch"]
+  # Wait for the galera StatefulSet to reach the expected replica count.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
+  # Read the Galera CR (status.rootDatabaseSecret etc.) for diagnostics.
+  - apiGroups: ["mariadb.openstack.org"]
+    resources: ["galeras"]
+    verbs: ["get", "list"]
+  # Scale the galera cluster down to 1 / back to 3 via the control plane CR.
+  # Editing the Galera CR or StatefulSet directly is reverted by the
+  # openstack-operator; scaling MUST go through OpenStackControlPlane.
+  - apiGroups: ["core.openstack.org"]
+    resources: ["openstackcontrolplanes"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhoso-galera-keeper
+  namespace: openstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rhoso-galera-keeper
+subjects:
+  - kind: ServiceAccount
+    name: rhoso-galera-keeper
+    namespace: openstack
+
+---
+# -----------------------------------------------------------------------------
+# Permanent backup PVC. Pre-exists at Kasten discovery time so it is captured
+# in the restore point. Sized for the logical dump(s); a few Gi is plenty for
+# OpenStack control-plane databases.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openstack-keeper
+  namespace: openstack
+  labels:
+    rhoso-galera-keeper: "true"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # CSI-snapshot-capable storage class — REPLACE for your cluster (see README).
+  storageClassName: <csi-snapshot-capable-storageclass>
+
+---
+# -----------------------------------------------------------------------------
+# Keeper Deployment. Idle pod; the blueprint KubeExecs into container "keeper".
+# Image only needs kubectl/oc + bash — mysqldump/mysql run inside the galera
+# pod via `kubectl exec`, so no MySQL client is required here.
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openstack-keeper
+  namespace: openstack
+  labels:
+    app: openstack-keeper
+    rhoso-galera-keeper: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openstack-keeper
+  template:
+    metadata:
+      labels:
+        app: openstack-keeper
+        rhoso-galera-keeper: "true"
+    spec:
+      serviceAccountName: rhoso-galera-keeper
+      containers:
+        - name: keeper
+          # Stock Red Hat image with oc/kubectl; pulled via the cluster's
+          # global pull secret on OpenShift. Pin to your OCP minor in prod.
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command: ["/bin/bash", "-c", "sleep infinity"]
+          env:
+            # OPTIONAL: name of the OpenStackControlPlane CR that manages this
+            # galera cluster. If unset, the blueprint discovers the single oscp
+            # in the namespace. Set it explicitly if you have more than one.
+            - name: CONTROLPLANE
+              value: ""
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: openstack-keeper
