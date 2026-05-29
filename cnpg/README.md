@@ -201,12 +201,6 @@ kubectl delete clusters.postgresql.cnpg.io pg-cluster -n cnpg-test
 RESTORE_POINT=$(kubectl get restorepoint -n cnpg-test \
   -o jsonpath='{.items[-1].metadata.name}')
 
-POLICY=$(kubectl get restorepoint -n cnpg-test "$RESTORE_POINT" \
-  -o jsonpath='{.metadata.labels.k10\.kasten\.io/policyName}')
-
-PROFILE=$(kubectl get policy "$POLICY" -n kasten-io \
-  -o jsonpath='{.spec.actions[?(@.action=="backup")].backupParameters.profile.name}')
-
 kubectl create -f - <<EOF
 apiVersion: actions.kio.kasten.io/v1alpha1
 kind: RestoreAction
@@ -220,11 +214,11 @@ spec:
     name: ${RESTORE_POINT}
     namespace: cnpg-test
   targetNamespace: cnpg-test
-  profile:
-    name: ${PROFILE}
-    namespace: kasten-io
 EOF
 ```
+
+> No `profile` is needed in the `RestoreAction` — Kasten extracts the location profile from
+> the `RestorePointContent` automatically.
 
 
 

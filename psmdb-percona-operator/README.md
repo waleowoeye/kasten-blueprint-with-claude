@@ -300,9 +300,7 @@ spec:
     excludeResources:
     - name: "mongod-data-my-psmdb-psmdb-db-rs0-0"   # adjust to non-quiesced PVC names
     - name: "mongod-data-my-psmdb-psmdb-db-rs0-1"   # adjust to non-quiesced PVC names
-  profile:
-    name: <LOCATION_PROFILE_NAME>
-    namespace: kasten-io
+  # No profile needed — Kasten extracts the location profile from the RestorePointContent.
 EOF
 ```
 

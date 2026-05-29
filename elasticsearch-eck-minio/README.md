@@ -341,9 +341,7 @@ spec:
     name: dr-restore-target
     namespace: elasticsearch-eck-minio
   targetNamespace: elasticsearch-eck-minio
-  profile:
-    name: <location-profile>
-    namespace: kasten-io
+  # No profile needed — Kasten extracts the location profile from the RestorePointContent.
 EOF
 ```
 

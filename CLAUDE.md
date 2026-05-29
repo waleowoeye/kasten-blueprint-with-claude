@@ -268,9 +268,9 @@ https://docs.kasten.io/latest/api/actions#api-cancel-action.
 ### Triggering a RestoreAction
 
 `RestorePoint` objects live in the **application namespace**. `RestoreAction` must also be created
-in the application namespace. A **Location profile** must be explicitly included in the spec
-whenever the restore will execute blueprint phases (restorePosthook etc.); without it Kasten cannot
-run Kanister operations.
+in the application namespace. You do **not** need to specify a `profile` in the `RestoreAction` —
+Kasten extracts the location profile required for Kanister blueprint phases (restorePosthook etc.)
+from the `RestorePointContent` automatically.
 
 ```bash
 # List available restore points for an app
@@ -290,18 +290,13 @@ spec:
     name: <RESTORE_POINT_NAME>
     namespace: <APP_NAMESPACE>
   targetNamespace: <APP_NAMESPACE>
-  profile:
-    name: <LOCATION_PROFILE_NAME>   # must be type=Location, e.g. "us-east-1"
-    namespace: kasten-io
 EOF
 ```
 
-> **Profile type**: the profile must be of type `Location` (S3, GCS, Azure Blob, etc.), not
-> `Infra`. Check with: `kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'`
-
-> **Policy requirement**: for the backup policy to supply a Kanister-compatible profile during
-> restores triggered via the policy, the `backupParameters.profile` must reference a `Location`
-> profile, not an `Infra` profile.
+> **Policy requirement**: for the backup policy to record a Kanister-compatible profile in the
+> `RestorePointContent` (which the restore then extracts automatically), the
+> `backupParameters.profile` must reference a `Location` profile (S3, GCS, Azure Blob, etc.), not
+> an `Infra` profile. Check with: `kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'`
 
 ## Cluster autonomy
 

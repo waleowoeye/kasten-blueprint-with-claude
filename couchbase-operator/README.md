@@ -211,9 +211,7 @@ spec:
     name: <RESTORE_POINT_NAME>
     namespace: $NAMESPACE
   targetNamespace: $NAMESPACE
-  profile:
-    name: <LOCATION_PROFILE_NAME>   # type=Location profile, e.g. "us-east-1"
-    namespace: kasten-io
+  # No profile needed — Kasten extracts the location profile from the RestorePointContent.
 EOF
 
 # 4. After the restore completes, the restorePosthook will automatically:

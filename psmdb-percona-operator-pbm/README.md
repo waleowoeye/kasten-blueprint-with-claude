@@ -301,10 +301,6 @@ kubectl get restorepoint -n psmdb-test
 
 RESTORE_POINT=$(kubectl get restorepoint -n psmdb-test \
   -o jsonpath='{.items[-1].metadata.name}')
-POLICY=$(kubectl get restorepoint -n psmdb-test "$RESTORE_POINT" \
-  -o jsonpath='{.metadata.labels.k10\.kasten\.io/policyName}')
-PROFILE=$(kubectl get policy "$POLICY" -n kasten-io \
-  -o jsonpath='{.spec.actions[?(@.action=="backup")].backupParameters.profile.name}')
 
 kubectl create -f - --validate=false <<EOF
 apiVersion: actions.kio.kasten.io/v1alpha1
@@ -319,9 +315,7 @@ spec:
     name: ${RESTORE_POINT}
     namespace: psmdb-test
   targetNamespace: psmdb-test
-  profile:
-    name: ${PROFILE}
-    namespace: kasten-io
+  # No profile needed — Kasten extracts the location profile from the RestorePointContent.
 EOF
 ```
 
