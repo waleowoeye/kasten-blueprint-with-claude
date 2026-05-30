@@ -5,11 +5,15 @@ metadata:
   namespace: kasten-io
 actions:
   backupPrehook:
+    outputArtifacts:
+      dummyArtifact:
+        keyValue:
+          dummyKey: "{{ .Phases.echoSTSDataAtBackupPrehook.Output.dummyKey }}"
     phases:
       - func: KubeTask
         name: echoSTSDataAtBackupPrehook
         args:
-          image: busybox
+          image: gcr.io/kasten-images/kanister-tools:8.5.2
           namespace: "{{ .Object.metadata.namespace }}"
           command:
             - sh
@@ -19,14 +23,18 @@ actions:
               {{- range $key, $value := .Object.metadata.labels }}
               echo "Label: {{ $key }}={{ $value }}"
               {{- end }}
+              # Emit a dummy output artifact captured into the restore point.
+              kando output dummyKey "dummyValue-$(date +%s)"
               echo backupPrehook completed.
-  
+
   restorePosthook:
+    inputArtifactNames:
+      - dummyArtifact
     phases:
       - func: KubeTask
         name: echoSTSDataAtRestorePosthook
         args:
-          image: busybox
+          image: gcr.io/kasten-images/kanister-tools:8.5.2
           namespace: "{{ .Object.metadata.namespace }}"
           command:
             - sh
@@ -36,4 +44,6 @@ actions:
               {{- range $key, $value := .Object.metadata.labels }}
               echo "Label: {{ $key }}={{ $value }}"
               {{- end }}
+              # Consume the dummy input artifact stored at backup time.
+              echo "Received dummy artifact: {{ .ArtifactsIn.dummyArtifact.KeyValue.dummyKey }}"
               echo restorePosthook completed.
